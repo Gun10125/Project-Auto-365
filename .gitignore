@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+
+# Browser profile and local Playwright data
+browser_profile/
+playwright-report/
+test-results/
+blob-report/
+
+# Generated screenshots and reports
+form_row*.png
+resolve_*.png
+*.log
+
+# Local Excel data and backups
+*.xlsx
+*.xlsm
+backup.xlsx
+
+# IDE and OS files
+.vscode/*
+!.vscode/settings.json
+.idea/
+.DS_Store
+Thumbs.db
