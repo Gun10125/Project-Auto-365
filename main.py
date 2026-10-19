@@ -408,19 +408,41 @@ def resolve_case(page, ticket, rtype, text, args):
 
 
 # ---------------- main ----------------
+def select_command():
+    print("\nเลือกการทำงาน")
+    print("1. new case")
+    print("2. resolve case")
+    while True:
+        choice = input("เลือกเมนู (1/2): ").strip()
+        if choice == "1":
+            return "new"
+        if choice == "2":
+            return "resolve"
+        print("กรุณาเลือก 1 หรือ 2")
+
+
 def main():
     ap = argparse.ArgumentParser(description="D365 Case Bot")
-    ap.add_argument("cmd", choices=["new", "resolve"])
+    ap.add_argument("cmd", nargs="?", choices=["new", "resolve"],
+                    help="คำสั่งที่ต้องการทำ ถ้าไม่ระบุจะแสดงเมนู")
     ap.add_argument("--xlsx")
     ap.add_argument("--case")
     ap.add_argument("--type", default="Resolved")
     ap.add_argument("--text")
-    ap.add_argument("--limit", type=int, default=1,
-                    help="จำนวนแถวสูงสุดที่ลอง (0 = ทุกแถว) ค่าเริ่มต้น 1 นับรวมแถวที่พลาดด้วย")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="จำนวนแถวสูงสุดที่ลอง (0 = ทุกแถว) ค่าเริ่มต้นทำทุกแถว")
     ap.add_argument("--row", type=int, help="ทำเฉพาะแถวนี้")
     ap.add_argument("--dry-run", action="store_true", help="กรอกแต่ไม่บันทึก")
-    ap.add_argument("--yes", action="store_true", help="ไม่ถามยืนยัน")
+    ap.add_argument("--yes", action="store_true", help="ใช้ต่อเนื่องเพื่อความเข้ากันได้ (ค่าเริ่มต้นไม่ถามอยู่แล้ว)")
+    ap.add_argument("--ask", action="store_true", help="ถามยืนยันก่อนบันทึกหรือ Resolve")
     args = ap.parse_args()
+    args.yes = not args.ask
+
+    if args.cmd is None:
+        args.cmd = select_command()
+        if not args.xlsx:
+            path = input("ไฟล์ Excel [data.xlsx]: ").strip()
+            args.xlsx = path or "data.xlsx"
 
     if args.cmd == "resolve" and not (args.xlsx or (args.case and args.text)):
         sys.exit("resolve ต้องมี --xlsx หรือ --case ... --text ...")
