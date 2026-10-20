@@ -28,6 +28,7 @@ D365 Case Bot  (Python + Playwright)  -- New Case / Resolve Case จากไฟ
 import argparse
 import re
 import sys
+import time
 from copy import copy
 from pathlib import Path
 
@@ -95,12 +96,26 @@ def valid_case_no(x):
 
 def short_err(e):
     lines = str(e).strip().splitlines()
-    return f"{type(e).__name__}: {lines[0][:150] if lines else ''}"
+    return f"{type(e).__name__}: {lines[0][:300] if lines else ''}"
 
 
 # ---------------- helpers ----------------
 def vis(page, data_id):
     return page.locator(f'[data-id="{data_id}"]:visible').first
+
+
+DIALOG_LOG = []      # ข้อความ dialog ที่เจอ (ใช้บอกสาเหตุตอน Resolve ไม่ได้)
+
+
+def dialog_text(page):
+    """ข้อความใน dialog ที่เปิดอยู่ (ถ้ามี)"""
+    try:
+        d = page.locator('[role="alertdialog"]:visible, [role="dialog"]:visible').last
+        if d.count():
+            return " ".join((d.inner_text(timeout=1500) or "").split())[:200]
+    except Exception:
+        pass
+    return ""
 
 
 def clear_dialogs(page, rounds=8):
@@ -112,7 +127,9 @@ def clear_dialogs(page, rounds=8):
             if btn.count():
                 label = (btn.first.inner_text() or "").strip()
                 if label in SAFE_DIALOG_LABELS:
-                    print(f"   dialog -> {label}")
+                    note = dialog_text(page)
+                    DIALOG_LOG.append(f"{label}: {note}")
+                    print(f"   dialog -> {label}" + (f"  [{note[:90]}]" if note else ""))
                     btn.first.click()
                     page.wait_for_timeout(900)
                     clicked = True
@@ -135,7 +152,12 @@ def set_text(page, data_id, value):
 def set_option(page, data_id, value):
     vis(page, data_id).click()
     opt = page.get_by_role("option", name=value, exact=True).first
-    opt.wait_for(timeout=10000)
+    try:
+        opt.wait_for(timeout=10000)
+    except Exception:
+        names = [t.strip() for t in page.get_by_role("option").all_inner_texts() if t.strip()]
+        page.keyboard.press("Escape")
+        raise RuntimeError(f"ไม่พบตัวเลือก '{value}' ตัวเลือกที่มี: {names[:12]}")
     opt.click()
 
 
@@ -344,6 +366,180 @@ def case_state(page, guid):
     )
 
 
+RESOLVE_SELECTORS = [
+    f'[data-id="{RESOLVE_BTN}"]',
+    '[data-id^="incident|NoRelationship|Form|"][data-id$=".Resolve"]',
+]
+
+
+def wait_form_ready(page):
+    """รอ command bar โหลด (ปุ่ม Save ขึ้น) แล้วเคลียร์ dialog เช่น Active Memo ที่มักโผล่หลังโหลดเสร็จ"""
+    try:
+        vis(page, SAVE_BTN).wait_for(timeout=45000)
+    except Exception:
+        pass
+    page.wait_for_timeout(1500)
+    clear_dialogs(page, rounds=4)
+
+
+def _visible_resolve_button(page):
+    for sel in RESOLVE_SELECTORS:
+        loc = page.locator(sel + ":visible")
+        if loc.count():
+            return loc.first
+    by_name = page.get_by_role("button", name=re.compile(r"^Resolve Case"))
+    if by_name.count():
+        return by_name.first
+    return None
+
+
+def find_resolve_button(page, timeout=30):
+    """หาปุ่ม Resolve Case หลายวิธี: data-id -> ชื่อปุ่ม -> เปิดเมนู ⋮ (More commands)"""
+    end = time.time() + timeout
+    while time.time() < end:
+        b = _visible_resolve_button(page)
+        if b is not None:
+            return b
+        page.wait_for_timeout(1000)
+    try:
+        page.locator('button[aria-label^="More commands"]:visible').first.click(timeout=3000)
+        page.wait_for_timeout(800)
+        b = _visible_resolve_button(page)
+        if b is not None:
+            print("   พบปุ่ม Resolve Case ในเมนู ⋮")
+            return b
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    return None
+
+
+def wait_resolve_dialog(page, timeout=30):
+    """คืน None เมื่อหน้าต่าง Resolve ขึ้นแล้ว หรือข้อความสาเหตุ ถ้าระบบไม่ยอมเปิด (เช่น activity ยังไม่ปิด)"""
+    end = time.time() + timeout
+    while time.time() < end:
+        if page.locator(f'[data-id="{RTYPE_SELECT}"]:visible').count():
+            return None
+        clear_dialogs(page, rounds=1)
+        if page.locator(f'[data-id="{RTYPE_SELECT}"]:visible').count():
+            return None
+    msgs = [m for m in DIALOG_LOG if m and "Ignore and save" not in m]
+    left = dialog_text(page)
+    if left:
+        msgs.append(left)
+    return "ระบบไม่เปิดหน้าต่าง Resolve: " + (" | ".join(msgs)[:250] if msgs else "ไม่มีข้อความจากระบบ")
+
+
+def dump_resolve_debug(page, ticket, extra=""):
+    """เซฟภาพ + รายการปุ่มบน command bar ตอน Resolve พลาด เพื่อดูสาเหตุจริง"""
+    try:
+        page.screenshot(path=f"resolve_fail_{ticket}.png")
+        items = page.evaluate(
+            r"""() => Array.from(document.querySelectorAll('[data-id^="incident|NoRelationship|Form|"]'))
+                .filter(e => e.offsetParent !== null)
+                .map(e => e.getAttribute('data-id') + ' | ' +
+                          (e.getAttribute('aria-label') || e.innerText || '').replace(/\s+/g, ' ').slice(0, 80))"""
+        )
+        body = "\n".join(items) + f"\n\nURL: {page.url}\nDialogs: " + " || ".join(DIALOG_LOG) + (f"\n\nสาเหตุ: {extra}" if extra else "")
+        Path(f"resolve_fail_{ticket}.txt").write_text(body, encoding="utf-8")
+        print(f"   เซฟรายละเอียดไว้ที่ resolve_fail_{ticket}.png และ .txt (ปุ่มที่เห็น {len(items)} ปุ่ม)")
+    except Exception as e:
+        print(f"   (เซฟรายละเอียดไม่สำเร็จ: {short_err(e)})")
+
+
+def wait_enabled(page, btn, secs):
+    """รอให้ปุ่มกดได้ (ไม่เทา) สูงสุด secs วินาที"""
+    for _ in range(int(secs)):
+        try:
+            if btn.is_enabled(timeout=1500):
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(1000)
+    return False
+
+
+def ensure_resolve_enabled(page, btn, allow_save=True):
+    """ปุ่ม Resolve Case เทา = ฟอร์ม Unsaved/โหลดไม่เสร็จ: รอ -> Save -> รีโหลด แล้วเช็กอีกครั้ง"""
+    if wait_enabled(page, btn, 10):
+        return btn
+    if not allow_save:
+        return None
+    print("   ปุ่ม Resolve Case ยังเทา (ฟอร์มอาจ Unsaved) -> กด Save ก่อน")
+    vis(page, SAVE_BTN).click()
+    clear_dialogs(page, rounds=6)             # Ignore and save / Save and continue
+    if wait_enabled(page, btn, 20):
+        return btn
+    print("   ยังเทาอยู่ -> รีโหลดหน้าแล้วลองใหม่")
+    page.reload()
+    vis(page, TITLE).wait_for(timeout=60000)
+    wait_form_ready(page)
+    btn = find_resolve_button(page)
+    if btn is not None and wait_enabled(page, btn, 20):
+        return btn
+    return None
+
+
+def error_texts(page):
+    """ข้อความ error/แจ้งเตือนที่ระบบแสดง (dialog ที่เคยกดผ่าน + alert ที่ค้างอยู่)"""
+    out = list(DIALOG_LOG)
+    try:
+        out += [" ".join(t.split())[:200] for t in
+                page.locator('[role="alert"]:visible, [role="alertdialog"]:visible').all_inner_texts()]
+    except Exception:
+        pass
+    return [t for t in dict.fromkeys(out) if t]
+
+
+def open_activities(page, guid):
+    """activity ที่ยังเปิดอยู่ของเคส (อ่านอย่างเดียว) ใช้บอกสาเหตุเมื่อ Resolve ไม่ผ่าน"""
+    try:
+        return page.evaluate(
+            r"""async (id) => {
+                const q = `/api/data/v9.0/activitypointers?$select=subject,activitytypecode` +
+                          `&$filter=_regardingobjectid_value eq ${id} and statecode eq 0&$top=10`;
+                const r = await fetch(q, {headers: {'Accept': 'application/json'}});
+                if (!r.ok) return null;
+                const j = await r.json();
+                return (j.value || []).map(a => `${a.activitytypecode}: ${(a.subject || '').slice(0, 50)}`);
+            }""",
+            guid,
+        )
+    except Exception:
+        return None
+
+
+def wait_resolved(page, guid, secs=90):
+    """Resolve ใน D365 ใช้เวลาประมวลผลหลายวินาที (ขึ้น 'Processing...') จึงถามสถานะซ้ำจนเป็น Resolved หรือหมดเวลา"""
+    state, none_count = None, 0
+    for i in range(int(secs // 2)):
+        page.wait_for_timeout(2000)
+        state = case_state(page, guid)
+        if state == 1:
+            return 1
+        if state not in (0, None):
+            return state                      # เช่น 2 = Cancelled
+        none_count = none_count + 1 if state is None else 0
+        if none_count >= 3:
+            return None                       # อ่านสถานะจาก API ไม่ได้
+        if i == 0:
+            print("   รอระบบประมวลผล Resolve...")
+    return state
+
+
+def fail_with_diagnostics(page, ticket, guid, headline):
+    """Resolve ไม่ผ่าน: รวมข้อความจากระบบ + activity ที่ยังเปิด เป็นเหตุผล แล้วเซฟภาพ/ไฟล์ไว้"""
+    msgs = error_texts(page)
+    acts = open_activities(page, guid)
+    reason = headline
+    if msgs:
+        reason += " | ข้อความจากระบบ: " + " / ".join(msgs)[:250]
+    if acts:
+        reason += f" | มี activity ที่ยังเปิด {len(acts)} รายการ: " + "; ".join(acts)[:150]
+    dump_resolve_debug(page, ticket, reason)
+    return "failed", reason
+
+
 def resolve_case(page, ticket, rtype, text, args):
     """คืน ('done'|'failed'|'skipped', เหตุผล)  ถ้ามี exception ผู้เรียกจะนับเป็น failed"""
     print(f"\n[Resolve] {ticket}")
@@ -361,31 +557,46 @@ def resolve_case(page, ticket, rtype, text, args):
 
     page.goto(RECORD_URL + guid)
     vis(page, TITLE).wait_for(timeout=60000)
-    clear_dialogs(page, rounds=3)             # Active Memo -> OK
+    wait_form_ready(page)                     # รอ command bar + เคลียร์ Active Memo
 
-    btn = page.locator(f'[data-id="{RESOLVE_BTN}"]:visible')
-    found = False
+    btn = None
     for attempt in range(2):
-        try:
-            btn.first.wait_for(timeout=30000)
-            found = True
+        btn = find_resolve_button(page)
+        if btn is not None:
             break
-        except Exception:
-            if attempt == 0:
-                print("   ยังไม่เห็นปุ่ม Resolve Case ลองรีโหลดหน้าอีกรอบ...")
-                page.reload()
-                vis(page, TITLE).wait_for(timeout=60000)
-                clear_dialogs(page, rounds=3)
-    if not found:
-        return "failed", "ไม่พบปุ่ม Resolve Case หลังลอง 2 รอบ"
+        if attempt == 0:
+            print("   ยังไม่เห็นปุ่ม Resolve Case ลองรีโหลดหน้าอีกรอบ...")
+            page.reload()
+            vis(page, TITLE).wait_for(timeout=60000)
+            wait_form_ready(page)
+    if btn is None:
+        dump_resolve_debug(page, ticket)
+        return "failed", f"ไม่พบปุ่ม Resolve Case (ดู resolve_fail_{ticket}.png/.txt)"
 
     if not args.dry_run and not confirm(f"   Resolve {ticket} ด้วย [{rtype}] '{text[:40]}'?", args.yes):
         print("   ข้าม")
         return "skipped", ""
 
-    btn.first.click()
-    clear_dialogs(page, rounds=3)             # Ignore and save
-    vis(page, RTYPE_SELECT).wait_for(timeout=30000)
+    btn = ensure_resolve_enabled(page, btn, allow_save=not args.dry_run)
+    if btn is None:
+        if args.dry_run:
+            print("   dry-run: ปุ่ม Resolve Case เทา (ไม่ได้กด Save ให้)")
+            return "skipped", ""
+        return fail_with_diagnostics(page, ticket, guid, "ปุ่ม Resolve Case เทา (กดไม่ได้) แม้ Save/รีโหลดแล้ว")
+
+    DIALOG_LOG.clear()
+    for attempt in range(2):                  # ถ้ามี dialog (เช่น Active Memo) โผล่มาบัง ให้เคลียร์แล้วกดใหม่
+        try:
+            btn.click(timeout=8000)
+            break
+        except Exception:
+            clear_dialogs(page, rounds=3)
+            if attempt == 1:
+                dump_resolve_debug(page, ticket)
+                return "failed", "กดปุ่ม Resolve Case ไม่ได้ (มีหน้าต่างบังอยู่)"
+    reason = wait_resolve_dialog(page)        # Ignore and save -> หน้าต่าง Resolve
+    if reason:
+        return fail_with_diagnostics(page, ticket, guid, reason)
     set_option(page, RTYPE_SELECT, rtype)
     set_text(page, RESOLUTION_INPUT, text)
     page.screenshot(path=f"resolve_{ticket}.png")
@@ -393,18 +604,21 @@ def resolve_case(page, ticket, rtype, text, args):
         input("   dry-run: กรอกครบแล้ว (ยังไม่กด Resolve) กด Enter เพื่อจบ...")
         return "skipped", ""
 
+    DIALOG_LOG.clear()
     vis(page, RESOLVE_OK).click()
     clear_dialogs(page, rounds=3)
-    page.locator(f'[data-id="{RESOLVE_OK}"]:visible').first.wait_for(state="hidden", timeout=30000)
-    page.wait_for_timeout(2500)
-    state = case_state(page, guid)
+    try:
+        page.locator(f'[data-id="{RESOLVE_OK}"]:visible').first.wait_for(state="hidden", timeout=30000)
+    except Exception:
+        return fail_with_diagnostics(page, ticket, guid, "กด Resolve แล้วแต่หน้าต่างไม่ปิด (ระบบน่าจะปฏิเสธ)")
+    state = wait_resolved(page, guid)
     if state == 1:
         print("   Resolve แล้ว (ยืนยันจากระบบ: สถานะ Resolved)")
         return "done", ""
     if state is None:
         print("   กด Resolve แล้ว แต่อ่านสถานะจากระบบไม่ได้ ตรวจในหน้าเว็บอีกครั้ง")
         return "done", "ยืนยันสถานะจากระบบไม่ได้"
-    return "failed", f"กด Resolve แล้วแต่ระบบรายงาน statecode={state} (ไม่ใช่ Resolved)"
+    return fail_with_diagnostics(page, ticket, guid, f"กด Resolve แล้วรอ 90 วินาที แต่ระบบยังรายงาน statecode={state} (ไม่ใช่ Resolved)")
 
 
 # ---------------- main ----------------
@@ -508,6 +722,7 @@ def main():
                             raise
                         except Exception as e:
                             outcome, why = "failed", short_err(e)
+                            dump_resolve_debug(page, no, why)
                             recover(page)
                         if outcome == "done":
                             sh.set(r, "rstatus", STATUS_OK)
