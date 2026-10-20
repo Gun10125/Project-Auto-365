@@ -461,15 +461,45 @@ def dump_resolve_debug(page, ticket, extra=""):
         print(f"   (เซฟรายละเอียดไม่สำเร็จ: {short_err(e)})")
 
 
-def wait_enabled(page, btn, secs):
-    """รอให้ปุ่มกดได้ (ไม่เทา) สูงสุด secs วินาที"""
+def wait_enabled(page, btn, secs, stable=2):
+    """รอให้ปุ่มกดได้ (ไม่เทา) ต่อเนื่อง `stable` ครั้ง สูงสุด secs วินาที"""
+    ok = 0
     for _ in range(int(secs)):
         try:
-            if btn.is_enabled(timeout=1500):
-                return True
+            ok = ok + 1 if btn.is_enabled(timeout=1500) else 0
+        except Exception:
+            ok = 0
+        if ok >= stable:
+            return True
+        page.wait_for_timeout(1000)
+    return False
+
+
+def form_is_dirty(page):
+    """ฟอร์มมีค่าที่ยังไม่ Save หรือไม่ (ผ่าน Xrm และ/หรือหัวฟอร์มที่ขึ้น '- Unsaved')"""
+    dirty = False
+    try:
+        v = page.evaluate("() => { try { return Xrm.Page.data.entity.getIsDirty(); } catch (e) { return null; } }")
+        dirty = bool(v)
+    except Exception:
+        pass
+    if not dirty:
+        try:
+            dirty = page.locator(':text-matches("Unsaved", "i"):visible').count() > 0
         except Exception:
             pass
+    return dirty
+
+
+def save_form(page, timeout=40):
+    """กด Save แล้วรอจนฟอร์มไม่ Unsaved (เคลียร์ dialog เคสซ้ำ/Unsaved changes ระหว่างทาง) คืน True เมื่อ Saved"""
+    vis(page, SAVE_BTN).click(timeout=10000)
+    for _ in range(int(timeout // 2)):
+        clear_dialogs(page, rounds=1)
         page.wait_for_timeout(1000)
+        if not form_is_dirty(page):
+            page.wait_for_timeout(1500)           # รอให้ command bar อัปเดตหลัง Saved
+            return True
     return False
 
 
@@ -591,6 +621,18 @@ def resolve_case(page, ticket, rtype, text, args):
         print("   ข้าม")
         return "skipped", ""
 
+    # ฟอร์ม Unsaved (กฎ/สคริปต์ในฟอร์มแก้ค่าตอนโหลด) ทำให้ Resolve ไม่ทำงาน: Save ก่อนเสมอ
+    if form_is_dirty(page):
+        if args.dry_run:
+            print("   dry-run: ฟอร์ม Unsaved (ตอนรันจริงจะกด Save ก่อน Resolve)")
+        else:
+            print("   ฟอร์ม Unsaved -> กด Save ก่อน Resolve")
+            if not save_form(page):
+                print("   ! Save แล้วฟอร์มยังเป็น Unsaved จะลองกด Resolve ต่อ")
+            nb = find_resolve_button(page)
+            if nb is not None:
+                btn = nb
+
     btn = ensure_resolve_enabled(page, btn, allow_save=not args.dry_run)
     if btn is None:
         if args.dry_run:
@@ -599,16 +641,33 @@ def resolve_case(page, ticket, rtype, text, args):
         return fail_with_diagnostics(page, ticket, guid, "ปุ่ม Resolve Case เทา (กดไม่ได้) แม้ Save/รีโหลดแล้ว")
 
     DIALOG_LOG.clear()
-    for attempt in range(2):                  # ถ้ามี dialog (เช่น Active Memo) โผล่มาบัง ให้เคลียร์แล้วกดใหม่
-        try:
-            btn.click(timeout=8000)
+    reason = None
+    for attempt in range(2):
+        clicked = False
+        for _ in range(2):                    # ถ้ามี dialog (เช่น Active Memo) โผล่มาบัง ให้เคลียร์แล้วกดใหม่
+            try:
+                btn.click(timeout=8000)
+                clicked = True
+                break
+            except Exception:
+                clear_dialogs(page, rounds=3)
+        if clicked:
+            reason = wait_resolve_dialog(page, timeout=20)   # Ignore and save -> หน้าต่าง Resolve
+        else:
+            reason = "กดปุ่ม Resolve Case ไม่ได้ (ปุ่มเทาหรือมีหน้าต่างบังอยู่)"
+        if reason is None:
             break
-        except Exception:
-            clear_dialogs(page, rounds=3)
-            if attempt == 1:
-                dump_resolve_debug(page, ticket)
-                return "failed", "กดปุ่ม Resolve Case ไม่ได้ (มีหน้าต่างบังอยู่)"
-    reason = wait_resolve_dialog(page)        # Ignore and save -> หน้าต่าง Resolve
+        if attempt == 0 and not args.dry_run and form_is_dirty(page):   # dry-run ห้าม Save
+            print("   หน้าต่าง Resolve ไม่เปิด และฟอร์ม Unsaved -> Save แล้วกดใหม่")
+            save_form(page)
+            nb = find_resolve_button(page)
+            if nb is not None:
+                btn = nb
+                continue
+        break
+    if reason and args.dry_run and form_is_dirty(page):
+        print("   dry-run: หน้าต่าง Resolve ไม่เปิดเพราะฟอร์ม Unsaved (ตอนรันจริงจะกด Save ก่อน)")
+        return "skipped", ""
     if reason:
         return fail_with_diagnostics(page, ticket, guid, reason)
     set_option(page, RTYPE_SELECT, rtype)
@@ -765,7 +824,9 @@ def main():
                             outcome, why = "failed", short_err(e)
                             dump_resolve_debug(page, no, why)
                             recover(page)
-                        if outcome == "done":
+                        if args.dry_run:
+                            print(f"   dry-run: ผล = {outcome} {why}  (ไม่เขียนลง Excel)")
+                        elif outcome == "done":
                             sh.set(r, "rstatus", STATUS_OK)
                         elif outcome == "failed":
                             sh.set(r, "rstatus", STATUS_FAIL)
