@@ -48,6 +48,19 @@ LIST_URL = (
 )
 RECORD_URL = f"{BASE}/main.aspx?appid={APP_ID}&forceUCI=1&pagetype=entityrecord&etn=incident&id="
 PROFILE_DIR = Path("browser_profile")          # ใช้ login เดียวกับ d365_recorder.py
+# โฟลเดอร์เก็บภาพ/ไฟล์ผลลัพธ์ (สร้างให้อัตโนมัติ):
+#   results/form_row/      form_row*.png      ภาพฟอร์ม New Case ก่อนกด Save
+#   results/resolve/       resolve_*.png      ภาพหน้าต่าง Resolve ก่อนกด Resolve
+#   results/resolve_fail/  resolve_fail_*.png + resolve_fail_*.txt  เมื่อ Resolve ไม่สำเร็จ
+RESULTS_DIR = Path("results")
+
+
+def result_path(sub, filename):
+    d = RESULTS_DIR / sub
+    d.mkdir(parents=True, exist_ok=True)
+    return d / filename
+
+
 SHEET = None                                    # None = ชีตแรก
 
 # ชื่อหัวคอลัมน์ใน Excel
@@ -309,7 +322,7 @@ def new_case(page, sh, r, args):
     if d["summary"]:
         set_text(page, DESC, d["summary"])
 
-    page.screenshot(path=f"form_row{r}.png")
+    page.screenshot(path=str(result_path("form_row", f"form_row{r}.png")))
     if args.dry_run:
         input("   dry-run: กรอกครบแล้ว (ยังไม่บันทึก) ตรวจหน้าจอ แล้วกด Enter เพื่อจบ...")
         return "skipped"
@@ -433,7 +446,7 @@ def wait_resolve_dialog(page, timeout=30):
 def dump_resolve_debug(page, ticket, extra=""):
     """เซฟภาพ + รายการปุ่มบน command bar ตอน Resolve พลาด เพื่อดูสาเหตุจริง"""
     try:
-        page.screenshot(path=f"resolve_fail_{ticket}.png")
+        page.screenshot(path=str(result_path("resolve_fail", f"resolve_fail_{ticket}.png")))
         items = page.evaluate(
             r"""() => Array.from(document.querySelectorAll('[data-id^="incident|NoRelationship|Form|"]'))
                 .filter(e => e.offsetParent !== null)
@@ -441,8 +454,8 @@ def dump_resolve_debug(page, ticket, extra=""):
                           (e.getAttribute('aria-label') || e.innerText || '').replace(/\s+/g, ' ').slice(0, 80))"""
         )
         body = "\n".join(items) + f"\n\nURL: {page.url}\nDialogs: " + " || ".join(DIALOG_LOG) + (f"\n\nสาเหตุ: {extra}" if extra else "")
-        Path(f"resolve_fail_{ticket}.txt").write_text(body, encoding="utf-8")
-        print(f"   เซฟรายละเอียดไว้ที่ resolve_fail_{ticket}.png และ .txt (ปุ่มที่เห็น {len(items)} ปุ่ม)")
+        result_path("resolve_fail", f"resolve_fail_{ticket}.txt").write_text(body, encoding="utf-8")
+        print(f"   เซฟรายละเอียดไว้ที่ {RESULTS_DIR / 'resolve_fail'} (resolve_fail_{ticket}.png / .txt)")
     except Exception as e:
         print(f"   (เซฟรายละเอียดไม่สำเร็จ: {short_err(e)})")
 
@@ -571,7 +584,7 @@ def resolve_case(page, ticket, rtype, text, args):
             wait_form_ready(page)
     if btn is None:
         dump_resolve_debug(page, ticket)
-        return "failed", f"ไม่พบปุ่ม Resolve Case (ดู resolve_fail_{ticket}.png/.txt)"
+        return "failed", f"ไม่พบปุ่ม Resolve Case (ดูใน {RESULTS_DIR / 'resolve_fail'})"
 
     if not args.dry_run and not confirm(f"   Resolve {ticket} ด้วย [{rtype}] '{text[:40]}'?", args.yes):
         print("   ข้าม")
@@ -599,7 +612,7 @@ def resolve_case(page, ticket, rtype, text, args):
         return fail_with_diagnostics(page, ticket, guid, reason)
     set_option(page, RTYPE_SELECT, rtype)
     set_text(page, RESOLUTION_INPUT, text)
-    page.screenshot(path=f"resolve_{ticket}.png")
+    page.screenshot(path=str(result_path("resolve", f"resolve_{ticket}.png")))
     if args.dry_run:
         input("   dry-run: กรอกครบแล้ว (ยังไม่กด Resolve) กด Enter เพื่อจบ...")
         return "skipped", ""
