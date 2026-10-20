@@ -1,0 +1,23 @@
+incident|NoRelationship|Form|Mscrm.Form.incident.Save | Save (CTRL+S) Save this Case.
+incident|NoRelationship|Form|Mscrm.Form.incident.SaveAndClose | Save & Close Save and close this Case.
+incident|NoRelationship|Form|Mscrm.Form.incident.SaveAndRunRoutingRule | Save & Route Save and route this case based on the active routing rule set.
+incident|NoRelationship|Form|Mscrm.Form.incident.RefreshModernButton | Refresh
+incident|NoRelationship|Form|Mscrm.Form.incident.NewRecord | New Create a new Case record.
+incident|NoRelationship|Form|FieldService.Form.incident.MainTab.Save.ConvertToWorkOrder | Convert to Work Order Convert Case to a Work Order
+incident|NoRelationship|Form|ARMS!07cc9a41aea3469dbe443af129880f11 | ARMS
+incident|NoRelationship|Form|Mscrm.Form.incident.Resolve | Resolve Case Close this case as resolved. All related activities must be closed 
+incident|NoRelationship|Form|Mscrm.Form.incident.Cancel | Cancel Case Cancel this case. After it is canceled, it can no longer be assigned
+incident|NoRelationship|Form|Mscrm.Form.incident.Assign | Assign Make someone else the owner of these Cases. If you want to keep ownership
+incident|NoRelationship|Form|Mscrm.Form.incident.QueueItemDetail | Queue Item Details View and edit details about this item. Some details are read-
+incident|NoRelationship|Form|Mscrm.Form.incident.CreateChildcase | Create Child Create a child case for a parent case.
+incident|NoRelationship|Form|Mscrm.Form.incident.DoNotDecrementEntitlementTerms | Don't decrement entitlement terms. For any associated entitlement, terms won't b
+incident|NoRelationship|Form|Mscrm.HomepageGrid.incident.MBPF.ConvertTo | Process Process Control Menu.
+incident|NoRelationship|Form|Mscrm.Form.incident.ConvertTo | Convert To
+incident|NoRelationship|Form|Mscrm.Form.incident.Flows.RefreshCommandBar | Run Flow Run a flow for this Case.
+incident|NoRelationship|Form|Mscrm.Form.incident.WordTemplate | Word Templates Quickly generate Word documents or create a new template.
+incident|NoRelationship|Form|Mscrm.Form.incident.Reports | Run Report Select a report to run. Run reports on records you select or on all r
+
+URL: https://operations-dc3-rth-prod01.crm5.dynamics.com/main.aspx?appid=02d373cd-b255-ec11-8f8f-000d3ac7aa53&forceUCI=1&pagetype=entityrecord&etn=incident&id=688be0ff-50cc-f111-a05c-6045bd1c0ddf
+Dialogs: Save and continue: Unsaved changes Do you want to save your changes before leaving this page? Save and continue Discard changes || OK: 
+
+สาเหตุ: TimeoutError: Locator.click: Timeout 20000ms exceeded.

@@ -25,6 +25,7 @@ D365 Case Bot  (Python + Playwright)  -- New Case / Resolve Case จากไฟ
 
 หมายเหตุ: ระบบจริงเป็น PROD ค่าเริ่มต้นจึงจำกัด 1 แถวต่อครั้งและถามยืนยันก่อนบันทึก/Resolve
 """
+import atexit
 import argparse
 import re
 import sys
@@ -635,20 +636,39 @@ def resolve_case(page, ticket, rtype, text, args):
 
 
 # ---------------- main ----------------
+_menu_mode = False
+_next_menu_command = None
+_menu_xlsx = None
+
+
 def select_command():
     print("\nเลือกการทำงาน")
     print("1. new case")
     print("2. resolve case")
+    print("0. ออกจากโปรแกรม")
     while True:
-        choice = input("เลือกเมนู (1/2): ").strip()
+        choice = input("เลือกเมนูดังกล่าว: ").strip()
         if choice == "1":
             return "new"
         if choice == "2":
             return "resolve"
-        print("กรุณาเลือก 1 หรือ 2")
+        if choice == "0":
+            return None
+        print("กรุณาเลือกตัวเลือก")
+
+
+def wait_for_exit():
+    """รอจนกว่าผู้ใช้จะกด q ก่อนออกจากโปรแกรม"""
+    while True:
+        choice = input("\nกด q แล้ว Enter เพื่อออกจากโปรแกรม: ").strip().lower()
+        if choice == "q":
+            return
+        print("กรุณากด q เพื่อออกจากโปรแกรม")
 
 
 def main():
+    global _menu_mode, _next_menu_command, _menu_xlsx
+
     ap = argparse.ArgumentParser(description="D365 Case Bot")
     ap.add_argument("cmd", nargs="?", choices=["new", "resolve"],
                     help="คำสั่งที่ต้องการทำ ถ้าไม่ระบุจะแสดงเมนู")
@@ -665,11 +685,19 @@ def main():
     args = ap.parse_args()
     args.yes = not args.ask
 
-    if args.cmd is None:
+    if _next_menu_command is not None:
+        args.cmd = _next_menu_command
+        _next_menu_command = None
+        args.xlsx = _menu_xlsx
+    elif args.cmd is None:
+        _menu_mode = True
         args.cmd = select_command()
+        if args.cmd is None:
+            return
         if not args.xlsx:
             path = input("ไฟล์ Excel [data.xlsx]: ").strip()
             args.xlsx = path or "data.xlsx"
+        _menu_xlsx = args.xlsx
 
     if args.cmd == "resolve" and not (args.xlsx or (args.case and args.text)):
         sys.exit("resolve ต้องมี --xlsx หรือ --case ... --text ...")
@@ -758,6 +786,11 @@ def main():
     if not results and sh is not None:
         print("ไม่มีแถวที่ต้องทำ: new = ต้องมี Case Title และเว้น Record Case ID ว่าง | "
               f"resolve = ต้องมี Record Case ID และ Resolution และสถานะยังไม่ใช่ '{STATUS_OK}'")
+    if _menu_mode:
+        print()
+        _next_menu_command = select_command()
+        if _next_menu_command is not None:
+            main()
 
 
 if __name__ == "__main__":
