@@ -29,6 +29,7 @@ import atexit
 import argparse
 import re
 import sys
+import csv
 import time
 from copy import copy
 from pathlib import Path
@@ -353,7 +354,7 @@ def new_case(page, sh, r, args):
 
 
 # ---------------- Resolve ----------------
-def case_guid(page, ticket):
+def _case_guid_once(page, ticket):
     return page.evaluate(
         """async (t) => {
             const q = `/api/data/v9.0/incidents?$select=incidentid&$filter=ticketnumber eq '${t}'`;
@@ -364,6 +365,19 @@ def case_guid(page, ticket):
         }""",
         ticket,
     )
+
+
+def case_guid(page, ticket):
+    """หา GUID ของเคส (ลอง 3 รอบ เพราะ API อ่านพลาดเป็นครั้งคราวได้)"""
+    for i in range(3):
+        try:
+            g = _case_guid_once(page, ticket)
+        except Exception:
+            g = None
+        if g:
+            return g
+        page.wait_for_timeout(2000)
+    return None
 
 
 def case_state(page, guid):
@@ -386,6 +400,24 @@ RESOLVE_SELECTORS = [
 ]
 
 
+def wait_not_processing(page, secs=60):
+    """รอให้ overlay 'Processing...' ของ D365 หาย (ระหว่างนั้นหน้าจอถูกบัง กดอะไรไม่ได้)"""
+    pat = re.compile(r"^\s*Processing\.\.\.\s*$", re.I)
+    announced = False
+    for _ in range(int(secs)):
+        try:
+            loc = page.get_by_text(pat)
+            if loc.count() == 0 or not loc.first.is_visible():
+                return True
+        except Exception:
+            return True
+        if not announced:
+            print("   รอระบบประมวลผล (Processing...)")
+            announced = True
+        page.wait_for_timeout(1000)
+    return False
+
+
 def wait_form_ready(page):
     """รอ command bar โหลด (ปุ่ม Save ขึ้น) แล้วเคลียร์ dialog เช่น Active Memo ที่มักโผล่หลังโหลดเสร็จ"""
     try:
@@ -393,6 +425,7 @@ def wait_form_ready(page):
     except Exception:
         pass
     page.wait_for_timeout(1500)
+    wait_not_processing(page, 45)
     clear_dialogs(page, rounds=4)
 
 
@@ -499,6 +532,7 @@ def save_form(page, timeout=40):
         page.wait_for_timeout(1000)
         if not form_is_dirty(page):
             page.wait_for_timeout(1500)           # รอให้ command bar อัปเดตหลัง Saved
+            wait_not_processing(page, 45)
             return True
     return False
 
@@ -553,7 +587,7 @@ def open_activities(page, guid):
         return None
 
 
-def wait_resolved(page, guid, secs=90):
+def wait_resolved(page, guid, secs=120):
     """Resolve ใน D365 ใช้เวลาประมวลผลหลายวินาที (ขึ้น 'Processing...') จึงถามสถานะซ้ำจนเป็น Resolved หรือหมดเวลา"""
     state, none_count = None, 0
     for i in range(int(secs // 2)):
@@ -589,6 +623,8 @@ def resolve_case(page, ticket, rtype, text, args):
     print(f"\n[Resolve] {ticket}")
     if not valid_case_no(ticket):
         return "failed", "รูปแบบเลขเคสไม่ถูกต้อง"
+    if BASE.split("//", 1)[1] not in page.url:        # หน้าเบราว์เซอร์ต้องอยู่ใน D365 ก่อนอ่าน API
+        ensure_login(page)
     guid = case_guid(page, ticket)            # อ่านอย่างเดียว ผ่าน session ของหน้าเว็บเอง
     if not guid:
         return "failed", "ไม่พบเคสนี้ (หรืออ่าน API ไม่ได้)"
@@ -644,6 +680,7 @@ def resolve_case(page, ticket, rtype, text, args):
     reason = None
     for attempt in range(2):
         clicked = False
+        wait_not_processing(page, 30)         # ถ้า overlay Processing... บังอยู่ รอให้หายก่อน
         for _ in range(2):                    # ถ้ามี dialog (เช่น Active Memo) โผล่มาบัง ให้เคลียร์แล้วกดใหม่
             try:
                 btn.click(timeout=8000)
@@ -687,11 +724,162 @@ def resolve_case(page, ticket, rtype, text, args):
     state = wait_resolved(page, guid)
     if state == 1:
         print("   Resolve แล้ว (ยืนยันจากระบบ: สถานะ Resolved)")
+        wait_not_processing(page, 30)         # ให้ระบบเสร็จจริงก่อนไปเคสถัดไป
         return "done", ""
     if state is None:
         print("   กด Resolve แล้ว แต่อ่านสถานะจากระบบไม่ได้ ตรวจในหน้าเว็บอีกครั้ง")
         return "done", "ยืนยันสถานะจากระบบไม่ได้"
-    return fail_with_diagnostics(page, ticket, guid, f"กด Resolve แล้วรอ 90 วินาที แต่ระบบยังรายงาน statecode={state} (ไม่ใช่ Resolved)")
+    return fail_with_diagnostics(page, ticket, guid, f"กด Resolve แล้วรอ 120 วินาที แต่ระบบยังรายงาน statecode={state} (ไม่ใช่ Resolved) รอบถัดไปจะเช็กสถานะซ้ำ")
+
+
+# ---------------- Resolve ผ่าน API (ทางเลือก: ใช้ด้วย --api) ----------------
+# เรียก action CloseIncident ของ Dataverse (ตัวเดียวกับที่ปุ่ม Resolve Case ในหน้าเว็บเรียก) ผ่าน session ของหน้าเว็บเอง
+# ไม่ต้องคลิกปุ่ม จึงไม่ติดปัญหาฟอร์ม Unsaved / Processing... / ปุ่มเทา และได้ข้อความ error จริงจากเซิร์ฟเวอร์
+# ข้อจำกัด: ข้ามกฎ/สคริปต์ฝั่งหน้าฟอร์ม (กฎฝั่งเซิร์ฟเวอร์ เช่น activity ที่ยังไม่ปิด ยังทำงานตามปกติ)
+SUBJECT_MAX = 200          # ความยาวสูงสุดของ subject ใน incidentresolution
+
+STATUS_OPTIONS_JS = r"""async () => {
+    const q = `${location.origin}/api/data/v9.2/EntityDefinitions(LogicalName='incident')` +
+              `/Attributes(LogicalName='statuscode')/Microsoft.Dynamics.CRM.StatusAttributeMetadata` +
+              `?$select=LogicalName&$expand=OptionSet($select=Options)`;
+    const r = await fetch(q, {headers: {'Accept': 'application/json', 'OData-MaxVersion': '4.0', 'OData-Version': '4.0'},
+                              credentials: 'include'});
+    if (!r.ok) return {error: 'HTTP ' + r.status};
+    const j = await r.json();
+    const opts = (j.OptionSet && j.OptionSet.Options) || [];
+    return {options: opts.map(o => ({
+        value: o.Value, state: o.State,
+        label: (o.Label && o.Label.UserLocalizedLabel && o.Label.UserLocalizedLabel.Label) || ''}))};
+}"""
+
+CLOSE_JS = r"""async ([guid, status, subject]) => {
+    const body = {
+        IncidentResolution: {
+            "@odata.type": "Microsoft.Dynamics.CRM.incidentresolution",
+            "incidentid@odata.bind": `/incidents(${guid})`,
+            subject: subject
+        },
+        Status: status
+    };
+    const r = await fetch(`${location.origin}/api/data/v9.2/CloseIncident`, {
+        method: 'POST',
+        headers: {'Accept': 'application/json', 'Content-Type': 'application/json; charset=utf-8',
+                  'OData-MaxVersion': '4.0', 'OData-Version': '4.0'},
+        credentials: 'include',
+        body: JSON.stringify(body)
+    });
+    let msg = '';
+    if (!r.ok) {
+        try { const j = await r.json(); msg = (j.error && j.error.message) || JSON.stringify(j); }
+        catch (e) { try { msg = await r.text(); } catch (e2) { msg = ''; } }
+    }
+    return {ok: r.ok, status: r.status, message: msg};
+}"""
+
+_STATUS_CACHE = {}
+
+
+def resolved_status_value(page, label):
+    """แปลงชื่อ Resolution Type (เช่น 'Resolved') เป็นค่า statuscode ของสถานะ Resolved อ่านจาก metadata ของระบบ
+    คืน (ค่า, None) หรือ (None, ข้อความ error)"""
+    if "opts" not in _STATUS_CACHE:
+        res = page.evaluate(STATUS_OPTIONS_JS)
+        if not res or res.get("error"):
+            return None, f"อ่านรายการ Resolution Type จากระบบไม่ได้ ({(res or {}).get('error', 'ไม่มีผลลัพธ์')})"
+        _STATUS_CACHE["opts"] = res.get("options", [])
+    resolved = [o for o in _STATUS_CACHE["opts"] if o.get("state") == 1]     # statecode 1 = Resolved
+    want = " ".join((label or "").split()).casefold()
+    for o in resolved:
+        if " ".join((o.get("label") or "").split()).casefold() == want:
+            return o["value"], None
+    names = [o.get("label") for o in resolved]
+    return None, f"ไม่พบ Resolution Type '{label}' ในระบบ ตัวเลือกที่มี: {names}"
+
+
+def resolve_case_api(page, ticket, rtype, text, args):
+    """คืน ('done'|'failed'|'skipped', เหตุผล)  ทำงานเหมือน resolve_case แต่ไม่คลิกหน้าเว็บ"""
+    print(f"\n[Resolve/API] {ticket}")
+    if not valid_case_no(ticket):
+        return "failed", "รูปแบบเลขเคสไม่ถูกต้อง"
+    if BASE.split("//", 1)[1] not in page.url:
+        ensure_login(page)
+    guid = case_guid(page, ticket)
+    if not guid:
+        return "failed", "ไม่พบเคสนี้ (หรืออ่าน API ไม่ได้)"
+    st = case_state(page, guid)
+    if st == 1:
+        print("   เคสนี้ Resolved อยู่แล้ว")
+        return "done", "Resolved อยู่แล้ว"
+    if st == 2:
+        return "failed", "เคสถูก Cancel ไปแล้ว"
+
+    subject = (text or "").strip()
+    if not subject:
+        return "failed", "ช่อง Resolution ว่าง"
+    if len(subject) > SUBJECT_MAX:
+        return "failed", f"Resolution ยาว {len(subject)} ตัวอักษร เกิน {SUBJECT_MAX} (ระบบไม่รับ) ตัดให้สั้นลงใน Excel"
+    value, err = resolved_status_value(page, rtype)
+    if err:
+        return "failed", err
+
+    print(f"   Resolution Type '{rtype}' -> statuscode {value} | Resolution: {subject[:60]}")
+    if args.dry_run:
+        print("   dry-run: ยังไม่ส่งคำสั่ง Resolve (ตรวจค่าข้างบนว่าถูกต้อง)")
+        return "skipped", ""
+    if not confirm(f"   Resolve {ticket} ผ่าน API ด้วย [{rtype}] '{subject[:40]}'?", args.yes):
+        print("   ข้าม")
+        return "skipped", ""
+
+    res = page.evaluate(CLOSE_JS, [guid, value, subject])
+    if not res or not res.get("ok"):
+        status = (res or {}).get("status")
+        msg = " ".join(((res or {}).get("message") or "").split())[:300]
+        return "failed", f"ระบบปฏิเสธ (HTTP {status}): {msg or 'ไม่มีข้อความ'}"
+    state = wait_resolved(page, guid)
+    if state == 1:
+        print("   Resolve แล้ว (ยืนยันจากระบบ: สถานะ Resolved)")
+        return "done", ""
+    if state is None:
+        print("   ส่งคำสั่งแล้ว แต่อ่านสถานะจากระบบไม่ได้ ตรวจในหน้าเว็บอีกครั้ง")
+        return "done", "ยืนยันสถานะจากระบบไม่ได้"
+    return "failed", f"ส่งคำสั่งแล้วแต่ระบบยังรายงาน statecode={state} (ไม่ใช่ Resolved)"
+
+
+def log_result(ticket, outcome, why):
+    """บันทึกผล Resolve ทุกเคสลง results/resolve_log.csv (ไว้ดูย้อนหลังว่าพลาดเพราะอะไร)"""
+    try:
+        f = result_path("", "resolve_log.csv")
+        new = not f.exists()
+        with open(f, "a", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh)
+            if new:
+                w.writerow(["เวลา", "เลขเคส", "ผล", "เหตุผล"])
+            w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), ticket, outcome, why])
+    except Exception as e:
+        print(f"   (บันทึก log ไม่สำเร็จ: {short_err(e)})")
+
+
+def resolve_with_retry(page, ticket, rtype, text, args, tries=2):
+    """Resolve 1 เคส ถ้าพลาดจะโหลดหน้าใหม่แล้วลองอีก (รอบถัดไปเช็กสถานะก่อน
+    ถ้าเคสถูก Resolve ไปแล้วจะนับเป็นสำเร็จ) dry-run และ skipped ไม่ลองซ้ำ"""
+    outcome, why = "failed", ""
+    for i in range(tries):
+        try:
+            fn = resolve_case_api if getattr(args, "api", False) else resolve_case
+            outcome, why = fn(page, ticket, rtype, text, args)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            outcome, why = "failed", short_err(e)
+            if not getattr(args, "api", False):
+                dump_resolve_debug(page, ticket, why)
+        if outcome != "failed" or args.dry_run:
+            return outcome, why
+        print(f"   ไม่สำเร็จ ({why})")
+        recover(page)                               # กลับหน้ารายการ เริ่มรอบใหม่จากหน้าสะอาด
+        if i + 1 < tries:
+            print(f"   ลองใหม่ครั้งที่ {i + 2}/{tries} ...")
+    return outcome, why
 
 
 # ---------------- main ----------------
@@ -740,6 +928,8 @@ def main():
     ap.add_argument("--row", type=int, help="ทำเฉพาะแถวนี้")
     ap.add_argument("--dry-run", action="store_true", help="กรอกแต่ไม่บันทึก")
     ap.add_argument("--yes", action="store_true", help="ใช้ต่อเนื่องเพื่อความเข้ากันได้ (ค่าเริ่มต้นไม่ถามอยู่แล้ว)")
+    ap.add_argument("--api", action="store_true",
+                    help="Resolve ผ่าน API (CloseIncident) แทนการคลิกหน้าเว็บ ใช้ --dry-run ดูค่าก่อนได้")
     ap.add_argument("--ask", action="store_true", help="ถามยืนยันก่อนบันทึกหรือ Resolve")
     args = ap.parse_args()
     args.yes = not args.ask
@@ -782,7 +972,8 @@ def main():
             ensure_login(page)
 
             if args.cmd == "resolve" and args.case:
-                outcome, why = resolve_case(page, args.case, args.type, args.text, args)
+                outcome, why = resolve_with_retry(page, args.case, args.type, args.text, args)
+                log_result(args.case, outcome, why)
                 results.append((0, outcome, why))
             else:
                 attempted = 0
@@ -816,14 +1007,9 @@ def main():
                             continue
                         attempted += 1
                         rtype = sh.get(r, "rtype") or "Resolved"
-                        try:
-                            outcome, why = resolve_case(page, no, rtype, res, args)
-                        except KeyboardInterrupt:
-                            raise
-                        except Exception as e:
-                            outcome, why = "failed", short_err(e)
-                            dump_resolve_debug(page, no, why)
-                            recover(page)
+                        outcome, why = resolve_with_retry(page, no, rtype, res, args)
+                        if not args.dry_run:
+                            log_result(no, outcome, why)
                         if args.dry_run:
                             print(f"   dry-run: ผล = {outcome} {why}  (ไม่เขียนลง Excel)")
                         elif outcome == "done":

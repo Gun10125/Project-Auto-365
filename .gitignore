@@ -20,6 +20,7 @@ test-results/
 blob-report/
 
 # Generated screenshots and reports
+results/
 form_row*.png
 resolve_*.png
 *.log
