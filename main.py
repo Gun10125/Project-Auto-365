@@ -48,6 +48,7 @@ LIST_URL = (
     f"{BASE}/main.aspx?appid={APP_ID}&forceUCI=1&pagetype=entitylist&etn=incident"
     "&viewid=a8ce8755-787a-f111-ab0e-6045bd219565&viewType=1039"
 )
+OPEN_CASE_FROM_LIST = True   # วิธี Resolve แบบกดหน้าจอ: เปิดเคสจากรายการ (ค้นหาเลขเคสแล้วคลิก) ไม่เปิดด้วยลิงก์ GUID
 RECORD_URL = f"{BASE}/main.aspx?appid={APP_ID}&forceUCI=1&pagetype=entityrecord&etn=incident&id="
 PROFILE_DIR = Path("browser_profile")          # ใช้ login เดียวกับ d365_recorder.py
 # โฟลเดอร์เก็บภาพ/ไฟล์ผลลัพธ์ (สร้างให้อัตโนมัติ):
@@ -618,6 +619,35 @@ def fail_with_diagnostics(page, ticket, guid, headline):
     return "failed", reason
 
 
+def open_case(page, ticket, guid):
+    """เปิดเคสแบบที่คนทำ: ค้นหาเลขเคสในหน้ารายการแล้วคลิกเปิด ถ้าไม่สำเร็จค่อยถอยไปใช้ลิงก์ GUID
+    คืน 'list' หรือ 'guid' (บอกว่าใช้ทางไหนเปิด)"""
+    if OPEN_CASE_FROM_LIST:
+        try:
+            page.goto(LIST_URL)
+            page.locator(f'[data-id="{NEW_CASE_BTN}"]').first.wait_for(timeout=60000)
+            clear_dialogs(page, rounds=2)
+            box = page.locator('input[placeholder*="Filter by keyword" i], '
+                               'input[aria-label*="Filter by keyword" i]').first
+            box.wait_for(timeout=15000)
+            box.click()
+            box.fill(ticket)
+            box.press("Enter")
+            row = page.locator('[role="row"]', has_text=ticket).first
+            row.wait_for(timeout=20000)
+            links = row.locator('a, [role="link"]')
+            (links.first if links.count() else row.locator('[role="gridcell"]', has_text=ticket).first).click()
+            page.wait_for_url(re.compile(re.escape(guid), re.I), timeout=20000)   # ยืนยันว่าเปิดถูกเคส
+            vis(page, TITLE).wait_for(timeout=60000)
+            print("   เปิดเคสจากรายการ")
+            return "list"
+        except Exception as e:
+            print(f"   (เปิดจากรายการไม่ได้: {short_err(e)} -> ใช้ลิงก์ GUID แทน)")
+    page.goto(RECORD_URL + guid)
+    vis(page, TITLE).wait_for(timeout=60000)
+    return "guid"
+
+
 def resolve_case(page, ticket, rtype, text, args):
     """คืน ('done'|'failed'|'skipped', เหตุผล)  ถ้ามี exception ผู้เรียกจะนับเป็น failed"""
     print(f"\n[Resolve] {ticket}")
@@ -635,8 +665,7 @@ def resolve_case(page, ticket, rtype, text, args):
     if st == 2:
         return "failed", "เคสถูก Cancel ไปแล้ว"
 
-    page.goto(RECORD_URL + guid)
-    vis(page, TITLE).wait_for(timeout=60000)
+    open_case(page, ticket, guid)             # เปิดจากรายการ (สำรอง: ลิงก์ GUID)
     wait_form_ready(page)                     # รอ command bar + เคลียร์ Active Memo
 
     btn = None
@@ -889,19 +918,42 @@ _menu_xlsx = None
 
 
 def select_command():
+    """คืน 'new' | 'resolve' (2.1 กดผ่านหน้าจอ) | 'resolve_api' (2.2 API) | None (ออก)"""
     print("\nเลือกการทำงาน")
     print("1. new case")
     print("2. resolve case")
+    print("   2.1 Resolve (กดผ่านหน้าจอ)")
+    print("   2.2 Resolve API")
     print("0. ออกจากโปรแกรม")
     while True:
         choice = input("เลือกเมนูดังกล่าว: ").strip()
         if choice == "1":
             return "new"
-        if choice == "2":
+        if choice == "2.1":
             return "resolve"
+        if choice == "2.2":
+            return "resolve_api"
+        if choice == "2":
+            while True:
+                sub = input("เลือกวิธี Resolve  1 = กดผ่านหน้าจอ (2.1)  2 = API (2.2): ").strip()
+                if sub in ("1", "2.1"):
+                    return "resolve"
+                if sub in ("2", "2.2"):
+                    return "resolve_api"
+                print("กรุณาเลือก 1 หรือ 2")
         if choice == "0":
             return None
         print("กรุณาเลือกตัวเลือก")
+
+
+def apply_menu_choice(args, choice):
+    """แปลงตัวเลือกจากเมนูเป็น args.cmd และ args.api"""
+    if choice == "resolve_api":
+        args.cmd, args.api = "resolve", True
+    elif choice == "resolve":
+        args.cmd, args.api = "resolve", False
+    else:
+        args.cmd = choice
 
 
 def wait_for_exit():
@@ -935,14 +987,15 @@ def main():
     args.yes = not args.ask
 
     if _next_menu_command is not None:
-        args.cmd = _next_menu_command
+        apply_menu_choice(args, _next_menu_command)
         _next_menu_command = None
         args.xlsx = _menu_xlsx
     elif args.cmd is None:
         _menu_mode = True
-        args.cmd = select_command()
-        if args.cmd is None:
+        choice = select_command()
+        if choice is None:
             return
+        apply_menu_choice(args, choice)
         if not args.xlsx:
             path = input("ไฟล์ Excel [data.xlsx]: ").strip()
             args.xlsx = path or "data.xlsx"
