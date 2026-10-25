@@ -23,6 +23,7 @@ blob-report/
 results/
 form_row*.png
 resolve_*.png
+resolve_*.txt
 *.log
 
 # Local Excel data and backups
