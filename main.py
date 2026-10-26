@@ -31,6 +31,8 @@ import re
 import sys
 import csv
 import time
+import zipfile
+import xml.etree.ElementTree as ET
 from copy import copy
 from pathlib import Path
 
@@ -64,14 +66,13 @@ def result_path(sub, filename):
     return d / filename
 
 
-SHEET = None                                    # None = ชีตแรก
+SHEET = "Cases"                                 # ชื่อชีตที่ใช้ (ถ้าไม่พบชื่อนี้จะใช้ชีตที่เปิดค้างอยู่)
 
 # ชื่อหัวคอลัมน์ใน Excel
 COL = {
     "title": "Case Title",
     "device": "Device Number/Config ID",
     "problem": "Problem Code",
-    "job": "Job Category",
     "priority": "Priority",
     "status": "Status Reason",
     "channel": "Channel",
@@ -81,7 +82,7 @@ COL = {
     "resolution": "Resolution",
     "rstatus": "Resolve Status",
 }
-OPTIONAL_COLS = {"job", "rstatus"}   # ไม่มีในไฟล์ก็ทำงานได้ (rstatus จะถูกเพิ่มให้เอง)
+OPTIONAL_COLS = {"rstatus"}   # ไม่มีในไฟล์ก็ทำงานได้ (rstatus จะถูกเพิ่มให้เอง)
 
 STATUS_OK = "Resolve complete"
 STATUS_FAIL = "Can't Resolve"
@@ -177,12 +178,43 @@ def set_option(page, data_id, value):
     opt.click()
 
 
+def _norm(t):
+    return " ".join((t or "").replace("*", " ").split()).casefold()
+
+
+def lookup_matches(cur, want):
+    """ค่าใน lookup ตรงกับที่ต้องการไหม: ต้องเท่ากัน หรือขึ้นต้นเหมือนกัน
+    ไม่ใช้ 'มีคำนี้อยู่ในข้อความ' เพราะ 'Office Hour' จะไปตรงกับ 'Non-Office Hour'"""
+    c, w = _norm(cur), _norm(want)
+    if not c or c in ("---", "--") or not w:
+        return False
+    return c == w or c.startswith(w) or w.startswith(c)
+
+
+def pick_item(items, text):
+    """เลือกผลการค้นหาที่ข้อความตรงที่สุด: เท่ากันก่อน แล้วขึ้นต้นเหมือนกัน แล้วตัวแรก"""
+    w = _norm(text)
+    texts = []
+    for i in range(items.count()):
+        try:
+            texts.append(_norm(items.nth(i).inner_text(timeout=2000)))
+        except Exception:
+            texts.append("")
+    for i, t in enumerate(texts):
+        if t == w:
+            return items.nth(i)
+    for i, t in enumerate(texts):
+        if t.startswith(w):
+            return items.nth(i)
+    return items.first
+
+
 def set_lookup(page, lk, text):
     """lookup เช่น ricoh_customerasset / ricoh_problemcode / ricoh_priority"""
     tag = page.locator(f'[data-id="{lk}.fieldControl-LookupResultsDropdown_{lk}_selected_tag_text"]:visible')
     if tag.count():
-        if text.lower() in (tag.first.inner_text() or "").lower():
-            return                                   # มีค่านี้อยู่แล้ว
+        if lookup_matches(tag.first.inner_text() or "", text):
+            return                                   # มีค่านี้อยู่แล้ว ไปต่อ (ไม่ลบ)
         cancel = page.locator(f'[data-id="{lk}.fieldControl-LookupResultsDropdown_{lk}_microsoftIcon_cancelButton"]:visible')
         if cancel.count():
             cancel.first.click()
@@ -190,9 +222,10 @@ def set_lookup(page, lk, text):
     inp.wait_for(timeout=15000)
     inp.click()
     inp.fill(text)
-    item = page.locator(f'span[data-id^="{lk}.fieldControl-"]:visible', has_text=text).first
-    item.wait_for(timeout=15000)
-    item.click()
+    items = page.locator(f'span[data-id^="{lk}.fieldControl-"]:visible', has_text=text)
+    items.first.wait_for(timeout=15000)
+    page.wait_for_timeout(400)                       # ให้รายการผลการค้นหาโหลดครบก่อนเลือก
+    pick_item(items, text).click()
     page.wait_for_timeout(500)
 
 
@@ -229,14 +262,50 @@ class Sheet:
         except PermissionError:
             sys.exit("เขียนไฟล์ Excel ไม่ได้: ปิดไฟล์นี้ใน Excel ก่อนแล้วรันใหม่")
         self.wb = openpyxl.load_workbook(path)
-        self.ws = self.wb[SHEET] if SHEET else self.wb.active
+        self.ws = self.wb[SHEET] if SHEET in self.wb.sheetnames else self.wb.active
+        self._restore_ext_validations()
         self._index()
+        missing = [v for k, v in COL.items() if k not in OPTIONAL_COLS and v not in self.head]
+        if missing:
+            sys.exit(f"ไม่พบคอลัมน์ในชีต '{self.ws.title}': {missing} (ยังไม่ได้แก้ไฟล์ Excel)")
         if "rstatus" not in self.idx:
             self._add_status_column()
             self._index()
-        missing = [v for k, v in COL.items() if k not in OPTIONAL_COLS and v not in self.head]
-        if missing:
-            sys.exit(f"ไม่พบคอลัมน์ใน Excel: {missing}")
+
+    def _restore_ext_validations(self):
+        """dropdown ที่ดึงรายการจากชีตอื่น (เช่น Lists!A2:A4) Excel เก็บแบบ x14 ซึ่ง openpyxl จะทิ้งตอนเซฟ
+        จึงอ่านจาก XML เดิมแล้วใส่กลับเป็น dropdown ปกติ เพื่อไม่ให้ dropdown หายหลังบอทเขียนไฟล์"""
+        try:
+            ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+                  "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+                  "x14": "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main",
+                  "xm": "http://schemas.microsoft.com/office/excel/2006/main"}
+            with zipfile.ZipFile(self.path) as z:
+                wbx = ET.fromstring(z.read("xl/workbook.xml"))
+                rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+                rid = next(sh.get("{%s}id" % ns["r"]) for sh in wbx.find("m:sheets", ns)
+                           if sh.get("name") == self.ws.title)
+                target = next(r.get("Target") for r in rels if r.get("Id") == rid)
+                part = target.lstrip("/") if target.startswith("/") else "xl/" + target
+                sheet = ET.fromstring(z.read(part))
+            have = {str(dv.sqref) for dv in self.ws.data_validations.dataValidation}
+            restored = 0
+            for x in sheet.iter("{%s}dataValidation" % ns["x14"]):
+                f = x.find("x14:formula1/xm:f", ns)
+                rng = x.find("xm:sqref", ns)
+                if f is None or rng is None or not f.text or not rng.text or rng.text in have:
+                    continue
+                dv = DataValidation(type=x.get("type") or "list", formula1=f.text,
+                                    allow_blank=x.get("allowBlank") == "1",
+                                    showErrorMessage=x.get("showErrorMessage") == "1",
+                                    showInputMessage=x.get("showInputMessage") == "1")
+                dv.add(rng.text)
+                self.ws.add_data_validation(dv)
+                restored += 1
+            if restored:
+                print(f"กู้ dropdown ที่อ้างอิงชีตอื่นกลับมา {restored} รายการ (กันหายตอนบอทเขียนไฟล์)")
+        except Exception as e:
+            print(f"(กู้ dropdown ไม่สำเร็จ: {short_err(e)})")
 
     def _index(self):
         self.head = {str(c.value).strip(): c.column for c in self.ws[1] if c.value}
@@ -303,9 +372,6 @@ def new_case(page, sh, r, args):
     """คืน 'done' | 'skipped'  (ถ้าพลาดจะ raise เพื่อให้ผู้เรียกข้ามไปแถวถัดไป)"""
     d = {k: sh.get(r, k) for k in COL}
     print(f"\n[แถว {r}] {d['title'][:70]}")
-    if d["job"]:
-        print(f"   ! Job Category '{d['job']}' ยังไม่ได้ทำอัตโนมัติ ต้องกรอกเอง")
-
     page.goto(LIST_URL)
     clear_dialogs(page, rounds=2)
     page.locator(f'[data-id="{NEW_CASE_BTN}"]').first.click()
