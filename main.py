@@ -136,7 +136,8 @@ def dialog_text(page):
 
 
 def clear_dialogs(page, rounds=8):
-    """กด dialog ที่รู้จัก (duplicate / unsaved / memo) จนไม่เหลือ"""
+    """กด dialog ที่รู้จัก (duplicate / unsaved / memo) จนไม่เหลือ  คืน True ถ้ากดอย่างน้อย 1 ครั้ง"""
+    any_clicked = False
     for _ in range(rounds):
         clicked = False
         for sel in SAFE_DIALOG_SELECTORS:
@@ -149,13 +150,14 @@ def clear_dialogs(page, rounds=8):
                     print(f"   dialog -> {label}" + (f"  [{note[:90]}]" if note else ""))
                     btn.first.click()
                     page.wait_for_timeout(900)
-                    clicked = True
+                    clicked = any_clicked = True
                     break
                 print(f"   (พบ dialog ที่ไม่รู้จัก '{label}' ไม่กดให้ ต้องกดเอง)")
         if not clicked:
             page.wait_for_timeout(1200)
             if not any(page.locator(s + ":visible").count() for s in SAFE_DIALOG_SELECTORS):
-                return
+                return any_clicked
+    return any_clicked
 
 
 def set_text(page, data_id, value):
@@ -368,28 +370,319 @@ class Sheet:
 
 
 # ---------------- New Case ----------------
+# ---------- วินิจฉัยตอนสร้างเคส (อ่านอย่างเดียว ไม่แก้ค่าในฟอร์ม) ----------
+# ไว้ตอบว่า Save ไม่ผ่านเพราะ dialog ที่บอทไม่ได้กด หรือเพราะช่อง Job Category หายไป
+# ผลลัพธ์อยู่ที่ results/new_fail/ (ภาพ + .txt ต่อแถวที่พลาด) และ results/new_log.csv (ทุกแถว)
+SAVE_TIMEOUT = 60          # วินาที: ระหว่างนี้บอทเฝ้า dialog และรอเลขเคสไปพร้อมกัน
+
+CLICK_AUDIT_JS = r"""(() => {
+    if (window.__clickLog) return;
+    window.__clickLog = [];
+    const info = (type, e) => {
+        let el = e.target;
+        try { el = (el.closest && el.closest('[data-id]')) || el; } catch (x) {}
+        const g = a => (el && el.getAttribute && el.getAttribute(a)) || '';
+        window.__clickLog.push({
+            t: new Date().toTimeString().slice(0, 8), type: type,
+            id: g('data-id'), label: g('aria-label') || g('title'),
+            text: ((el && el.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 40),
+            trusted: !!e.isTrusted
+        });
+        if (window.__clickLog.length > 300) window.__clickLog.shift();
+    };
+    document.addEventListener('click', e => info('click', e), true);
+    document.addEventListener('keydown', e => {
+        if (e.key === 'Delete' || e.key === 'Backspace') info('key:' + e.key, e);
+    }, true);
+})();"""
+
+READ_JOB_JS = r"""() => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').replace(/\*/g, '').trim().toLowerCase();
+    let name = null;
+    document.querySelectorAll('[data-id$="-field-label"]').forEach(el => {
+        if (!name && norm(el.innerText) === 'job category') name = el.getAttribute('data-id').replace(/-field-label$/, '');
+    });
+    if (!name) {
+        document.querySelectorAll('[data-id*=".fieldControl"]').forEach(el => {
+            const al = el.getAttribute('aria-label');
+            if (!name && al && norm(al).startsWith('job category')) name = el.getAttribute('data-id').split('.')[0];
+        });
+    }
+    if (!name) return {found: false};
+    const vis = el => !!(el && el.offsetParent !== null);
+    const tag = document.querySelector('[data-id="' + name + '.fieldControl-LookupResultsDropdown_' + name + '_selected_tag_text"]');
+    const sel = document.querySelector('[data-id="' + name + '.fieldControl-option-set-select"]');
+    let value = '';
+    if (tag && vis(tag)) value = (tag.innerText || '').replace(/\s+/g, ' ').trim();
+    else if (sel && vis(sel)) value = (sel.innerText || '').replace(/\s+/g, ' ').trim();
+    return {found: true, name: name, value: value};
+}"""
+
+READ_DIALOGS_JS = r"""() => {
+    const vis = el => !!(el && el.offsetParent !== null);
+    const out = [];
+    document.querySelectorAll('[role="dialog"], [role="alertdialog"]').forEach(d => {
+        if (!vis(d)) return;
+        const text = (d.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+        const buttons = Array.from(d.querySelectorAll('button')).filter(vis).map(b => ({
+            id: b.getAttribute('data-id') || '', text: (b.innerText || '').replace(/\s+/g, ' ').trim()}));
+        if (text && buttons.length) out.push({text: text, buttons: buttons});
+    });
+    return out;
+}"""
+
+
+def dialog_snapshot(page):
+    """dialog ที่เปิดอยู่ตอนนี้ (ข้อความ + ปุ่ม) ใช้แค่ดู ไม่กด"""
+    try:
+        return page.evaluate(READ_DIALOGS_JS) or []
+    except Exception:
+        return []
+
+
+def read_job_category(page):
+    """อ่านค่าช่อง Job Category (อ่านอย่างเดียว ไม่แก้) คืน dict: found, value"""
+    try:
+        r = page.evaluate(READ_JOB_JS)
+        return r if isinstance(r, dict) else {"found": False}
+    except Exception:
+        return {"found": False}
+
+
+class JobWatch:
+    """จดค่า Job Category หลังแต่ละขั้นตอน เพื่อดูว่าค่าหายตอนไหน (อ่านอย่างเดียว)"""
+    def __init__(self, page):
+        self.page, self.trail, self.lost_at = page, [], None
+
+    def mark(self, step):
+        r = read_job_category(self.page)
+        val = (r.get("value") or "") if r.get("found") else None
+        shown = "(หาช่องไม่เจอ)" if val is None else (val or "(ว่าง)")
+        prev = next((v for _, _, v in reversed(self.trail) if v is not None), None)
+        self.trail.append((time.strftime("%H:%M:%S"), step, val))
+        if val == "" and prev and self.lost_at is None:
+            self.lost_at = step
+            print(f"   ! Job Category หายไป ({step}) ก่อนหน้านี้คือ '{prev}'")
+        return shown
+
+    def last(self):
+        for _, _, v in reversed(self.trail):
+            if v is not None:
+                return v or "(ว่าง)"
+        return "(หาช่องไม่เจอ)"
+
+    def first(self):
+        for _, _, v in self.trail:
+            if v is not None:
+                return v or "(ว่าง)"
+        return "(หาช่องไม่เจอ)"
+
+
+def read_form_state(page):
+    """ค่าของช่องที่บอทกรอก ณ ตอนนี้ (อ่านอย่างเดียว) ใช้ใส่ในรายงานตอนพลาด"""
+    def tag(lk):
+        t = page.locator(f'[data-id="{lk}.fieldControl-LookupResultsDropdown_{lk}_selected_tag_text"]:visible')
+        return " ".join(t.first.inner_text(timeout=2000).split()) if t.count() else "(ว่าง)"
+    readers = {
+        "Case Title": lambda: vis(page, TITLE).input_value(timeout=2000),
+        "Device": lambda: tag("ricoh_customerasset"),
+        "Problem Code": lambda: tag("ricoh_problemcode"),
+        "Priority": lambda: tag("ricoh_priority"),
+        "Status Reason": lambda: " ".join(vis(page, STATUS_SELECT).inner_text(timeout=2000).split()),
+        "Channel": lambda: " ".join(vis(page, CHANNEL_SELECT).inner_text(timeout=2000).split()),
+        "Description": lambda: vis(page, DESC).input_value(timeout=2000)[:80],
+    }
+    out = {}
+    for k, f in readers.items():
+        try:
+            out[k] = f()
+        except Exception:
+            out[k] = "(อ่านไม่ได้)"
+    return out
+
+
+def click_audit(page, n=40):
+    """คลิก/กดปุ่มลบล่าสุดบนหน้าเว็บ (trusted = บอทหรือคนจริง, system = สคริปต์ของหน้าเว็บเอง)"""
+    try:
+        items = page.evaluate("(n) => (window.__clickLog || []).slice(-n)", n) or []
+    except Exception:
+        items = []
+    lines, job_clicks = [], 0
+    for it in items:
+        who = "บอท/คนจริง" if it.get("trusted") else "สคริปต์ของหน้า"
+        line = f"{it.get('t', '')} {it.get('type', ''):<11s} {who:<14s} {it.get('id') or '-'} | {it.get('label', '')} | {it.get('text', '')}"
+        if "job" in ((it.get("id") or "") + (it.get("label") or "")).lower():
+            job_clicks += 1
+            line += "   <== Job Category"
+        lines.append(line)
+    return lines, job_clicks
+
+
+def get_record_guid(page):
+    """GUID ของเคสที่เปิดอยู่ (มีค่าก็ต่อเมื่อบันทึกแล้ว) อ่านจาก Xrm หรือ URL"""
+    try:
+        g = page.evaluate("""() => { try { const id = Xrm.Page.data.entity.getId();
+                                           return id ? id.replace(/[{}]/g, '') : ''; } catch (e) { return ''; } }""")
+        if g:
+            return g
+    except Exception:
+        pass
+    m = re.search(r"[?&]id=(?:%7B|\{)?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", page.url or "")
+    return m.group(1) if m else ""
+
+
+def ticket_from_api(page, guid):
+    """เลขเคส (CAS-...) จาก API (อ่านอย่างเดียว) เผื่อช่อง ID บนฟอร์มยังไม่อัปเดต"""
+    try:
+        return page.evaluate(
+            """async (g) => {
+                const r = await fetch(`${location.origin}/api/data/v9.2/incidents(${g})?$select=ticketnumber`,
+                    {headers: {'Accept': 'application/json', 'OData-MaxVersion': '4.0', 'OData-Version': '4.0'},
+                     credentials: 'include'});
+                if (!r.ok) return '';
+                const j = await r.json();
+                return j.ticketnumber || '';
+            }""", guid) or ""
+    except Exception:
+        return ""
+
+
+def save_and_wait(page, row, timeout=SAVE_TIMEOUT):
+    """กด Save แล้ว 'เฝ้า dialog ไปพร้อมกับรอเลขเคส' ทุกวินาที (dialog ที่โผล่ช้าจะไม่หลุด)
+    คืน dict: case_no, guid, saved, dialogs (ที่กดแล้ว), unknown (ที่บอทไม่รู้จัก/ไม่ได้กด), seconds"""
+    res = {"case_no": "", "guid": "", "saved": False, "dialogs": [], "unknown": [], "seconds": 0}
+    stuck = {}
+    vis(page, SAVE_BTN).click()
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        before = len(DIALOG_LOG)
+        clear_dialogs(page, rounds=1)                       # กด dialog ที่รู้จัก (ใช้เวลาราว 1 วินาที/รอบ)
+        stamp = time.strftime("%H:%M:%S")
+        for entry in DIALOG_LOG[before:]:
+            res["dialogs"].append(f"[{stamp}] กดแล้ว: {entry}")
+        for dlg in dialog_snapshot(page):                   # ยังเหลือ dialog ค้างอยู่ = บอทไม่ได้กด
+            key = dlg["text"][:120]
+            stuck[key] = stuck.get(key, 0) + 1
+            if stuck[key] == 2:                             # เห็นซ้ำ 2 รอบติด ถือว่าบอทกดไม่ได้/ไม่รู้จัก
+                btns = ", ".join(f"{b['text']}({b['id']})" for b in dlg["buttons"])
+                res["unknown"].append(f"[{stamp}] ไม่ได้กด: {dlg['text']} | ปุ่ม: {btns}")
+                print(f"   ! dialog ที่บอทไม่ได้กด: {dlg['text'][:80]} | ปุ่ม: {btns}")
+                try:
+                    page.screenshot(path=str(result_path("new_fail", f"dialog_row{row}_{stamp.replace(':', '')}.png")))
+                except Exception:
+                    pass
+        guid = get_record_guid(page)
+        if guid:
+            res["guid"], res["saved"] = guid, True
+            try:
+                case_no = vis(page, TICKET).input_value(timeout=1500)
+            except Exception:
+                case_no = ""
+            if not case_no.startswith("CAS-"):
+                case_no = ticket_from_api(page, guid)
+            if case_no.startswith("CAS-"):
+                res["case_no"] = case_no
+                break
+    res["seconds"] = round(time.time() - t0)
+    return res
+
+
+def write_new_report(page, row, d, res, jw, state_before, reason):
+    """รายงานตอนสร้างเคสพลาด: results/new_fail/new_fail_row<N>.png + .txt"""
+    lines = [f"เวลา: {time.strftime('%Y-%m-%d %H:%M:%S')}", f"แถว Excel: {row}", f"Case Title: {d.get('title', '')}",
+             f"สรุป: {reason}", f"URL: {getattr(page, 'url', '')}"]
+    if res.get("guid"):
+        lines.append(f"GUID: {res['guid']}   (เปิดดูเคส: {RECORD_URL}{res['guid']})")
+    lines.append(f"บันทึกแล้วหรือยัง: {'บันทึกแล้ว (มี GUID)' if res.get('saved') else 'ยังไม่ได้บันทึก (ไม่มี GUID)'}"
+                 f" | รอหลังกด Save: {res.get('seconds', 0)} วินาที")
+    lines += ["", "== dialog ที่บอทกดแล้ว =="] + (res.get("dialogs") or ["(ไม่มี)"])
+    lines += ["", "== dialog ที่บอทไม่ได้กด/ไม่รู้จัก =="] + (res.get("unknown") or ["(ไม่มี)"])
+    now = dialog_snapshot(page)
+    lines += ["", "== dialog ที่ค้างอยู่ตอนพลาด =="]
+    lines += [f"{x['text']} | ปุ่ม: {', '.join(b['text'] + '(' + b['id'] + ')' for b in x['buttons'])}" for x in now] or ["(ไม่มี)"]
+    try:
+        alerts = page.locator('[role="alert"]:visible').all_inner_texts()
+    except Exception:
+        alerts = []
+    lines += ["", "== ข้อความแจ้งเตือน/ช่องบังคับที่เห็น =="] + ([" ".join(a.split())[:200] for a in alerts if a.strip()] or ["(ไม่มี)"])
+    lines += ["", "== Job Category (อ่านอย่างเดียว) =="]
+    lines += [f"{t}  {step:<28s} -> {('(หาช่องไม่เจอ)' if v is None else (v or '(ว่าง)'))}" for t, step, v in jw.trail] or ["(ไม่มีข้อมูล)"]
+    lines.append(f"หายไปหลังขั้นตอน: {jw.lost_at or 'ไม่พบว่าหาย'}")
+    clicks, job_clicks = click_audit(page)
+    lines.append(f"คลิก/กดลบที่เกี่ยวกับ Job Category: {job_clicks} ครั้ง")
+    lines += ["", "== ค่าช่องที่บอทกรอก ก่อน Save =="] + [f"{k}: {v}" for k, v in (state_before or {}).items()]
+    lines += ["", "== ค่าช่องที่บอทกรอก ตอนพลาด =="] + [f"{k}: {v}" for k, v in read_form_state(page).items()]
+    lines += ["", "== คลิกล่าสุดบนหน้าเว็บ (40 รายการ) =="] + (clicks or ["(ไม่มีข้อมูล)"])
+    try:
+        page.screenshot(path=str(result_path("new_fail", f"new_fail_row{row}.png")))
+    except Exception:
+        pass
+    f = result_path("new_fail", f"new_fail_row{row}.txt")
+    f.write_text("\n".join(lines), encoding="utf-8")
+    print(f"   เซฟรายงานไว้ที่ {f}")
+
+
+def log_new_result(row, d, outcome, case_no, jw, note=""):
+    """บันทึกผลสร้างเคสทุกแถวลง results/new_log.csv"""
+    try:
+        f = result_path("", "new_log.csv")
+        new = not f.exists()
+        with open(f, "a", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh)
+            if new:
+                w.writerow(["เวลา", "แถว", "Case Title", "ผล", "เลขเคส", "Job Category ตอนแรก", "Job Category ล่าสุด",
+                            "Job Category หายตอนไหน", "หมายเหตุ"])
+            w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), row, d.get("title", ""), outcome, case_no,
+                        jw.first(), jw.last(), jw.lost_at or "", note])
+    except Exception as e:
+        print(f"   (บันทึก log ไม่สำเร็จ: {short_err(e)})")
+
+
 def new_case(page, sh, r, args):
-    """คืน 'done' | 'skipped'  (ถ้าพลาดจะ raise เพื่อให้ผู้เรียกข้ามไปแถวถัดไป)"""
+    """คืน 'done' | 'skipped'  (ถ้าพลาดจะ raise เพื่อให้ผู้เรียกข้ามไปแถวถัดไป)
+    มีการจดข้อมูลวินิจฉัยตลอดทาง ถ้าพลาดจะได้รายงานใน results/new_fail/"""
     d = {k: sh.get(r, k) for k in COL}
+    jw = JobWatch(page)
+    try:
+        return _new_case_impl(page, sh, r, args, d, jw)
+    except Exception as e:
+        if not getattr(e, "reported", False):         # พลาดก่อนถึงขั้น Save (เช่น กรอกช่องไม่ได้)
+            try:
+                write_new_report(page, r, d, {}, jw, None, short_err(e))
+                log_new_result(r, d, "failed", "", jw, short_err(e))
+            except Exception:
+                pass
+        raise
+
+
+def _new_case_impl(page, sh, r, args, d, jw):
     print(f"\n[แถว {r}] {d['title'][:70]}")
     page.goto(LIST_URL)
     clear_dialogs(page, rounds=2)
     page.locator(f'[data-id="{NEW_CASE_BTN}"]').first.click()
     vis(page, TITLE).wait_for(timeout=60000)
+    jw.mark("เปิดฟอร์มใหม่")
 
     set_text(page, TITLE, d["title"])
+    jw.mark("หลังกรอก Case Title")
     if d["device"]:
         set_lookup(page, "ricoh_customerasset", d["device"])
+        jw.mark("หลังกรอก Device")
     if d["problem"]:
         set_lookup(page, "ricoh_problemcode", d["problem"])
+        jw.mark("หลังกรอก Problem Code")
     if d["priority"]:
         set_lookup(page, "ricoh_priority", d["priority"])
+        jw.mark("หลังกรอก Priority")
     if d["status"]:
         set_option(page, STATUS_SELECT, d["status"])
+        jw.mark("หลังกรอก Status Reason")
     if d["channel"]:
         set_option(page, CHANNEL_SELECT, d["channel"])
+        jw.mark("หลังกรอก Channel")
     if d["summary"]:
         set_text(page, DESC, d["summary"])
+        jw.mark("หลังกรอก Description")
 
     page.screenshot(path=str(result_path("form_row", f"form_row{r}.png")))
     if args.dry_run:
@@ -399,24 +692,34 @@ def new_case(page, sh, r, args):
         print("   ข้าม")
         return "skipped"
 
-    clicked_save = False
-    try:
-        vis(page, SAVE_BTN).click()
-        clicked_save = True
-        clear_dialogs(page)
-        ticket = vis(page, TICKET)
-        expect(ticket).to_have_value(re.compile(r"^CAS-"), timeout=40000)
-        case_no = ticket.input_value()
-    except Exception:
-        if clicked_save:
-            # กด Save ไปแล้ว เคสอาจถูกสร้างจริง จึงทำเครื่องหมายไว้ กันสร้างซ้ำตอนรันรอบหน้า
+    jw.mark("ก่อน Save")
+    state_before = read_form_state(page)
+    res = save_and_wait(page, r)
+    jw.mark("หลัง Save")
+
+    if not res["case_no"]:
+        if res["saved"]:
+            # มี GUID แล้ว = เคสถูกสร้างจริงแต่อ่านเลขเคสไม่ได้ ทำเครื่องหมายกันสร้างซ้ำตอนรันรอบหน้า
             sh.set(r, "case_id", UNCONFIRMED)
-            print(f"   !!! กด Save แล้วแต่ยืนยันเลขเคสไม่ได้ ตรวจใน D365 ว่าเคสถูกสร้างหรือไม่ "
-                  f"(ใส่ '{UNCONFIRMED}' ในช่อง Record Case ID แล้ว)")
-        raise
-    print(f"   สร้างแล้ว: {case_no}")
-    sh.set(r, "case_id", case_no)
+            reason = (f"Save สำเร็จ (GUID {res['guid']}) แต่อ่านเลขเคสไม่ได้ ตรวจใน D365 "
+                      f"(ใส่ '{UNCONFIRMED}' ในช่อง Record Case ID แล้ว)")
+        elif res["unknown"]:
+            reason = "Save ไม่ผ่านเพราะมี dialog ที่บอทไม่ได้กด: " + res["unknown"][0][:160]
+        else:
+            reason = (f"Save ไม่ผ่านภายใน {res['seconds']} วินาที ไม่มี dialog ค้าง "
+                      f"(อาจมีช่องบังคับไม่ครบ" + (f" เช่น Job Category หายไปหลัง '{jw.lost_at}'" if jw.lost_at else "") + ")")
+        print(f"   !!! {reason}")
+        write_new_report(page, r, d, res, jw, state_before, reason)
+        log_new_result(r, d, "failed", "", jw, reason)
+        err = RuntimeError(reason)
+        err.reported = True
+        raise err
+
+    print(f"   สร้างแล้ว: {res['case_no']}")
+    sh.set(r, "case_id", res["case_no"])
     clear_dialogs(page, rounds=3)
+    log_new_result(r, d, "done", res["case_no"], jw,
+                   f"กด dialog {len(res['dialogs'])} ครั้ง" + (f" | dialog ที่ไม่ได้กด {len(res['unknown'])}" if res["unknown"] else ""))
     return "done"
 
 
@@ -1086,6 +1389,7 @@ def main():
             str(PROFILE_DIR), headless=False, no_viewport=True, args=["--start-maximized"])
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.set_default_timeout(20000)
+        page.add_init_script(CLICK_AUDIT_JS)       # จดคลิกบนหน้าเว็บ ไว้ดูว่าใครกดลบช่องไหน
         page.on("dialog", on_dialog)
         try:
             ensure_login(page)
