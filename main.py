@@ -6,15 +6,15 @@ D365 Case Bot  (Python + Playwright)  -- New Case / Resolve Case จากไฟ
 วิธีใช้ (ปิด d365_recorder.py และปิดไฟล์ใน Excel ก่อน เพราะใช้ browser_profile/ และไฟล์เดียวกัน):
 
   # ทดลองกรอกฟอร์มแถวแรกโดยไม่บันทึก
-  python main.py new --xlsx data.xlsx --dry-run
+  python main.py new --xlsx data\\data-xsecure.xlsx --dry-run
 
   # สร้างเคสจริง: ค่าเริ่มต้นทำ 1 แถว ถามยืนยันก่อน Save
-  python main.py new --xlsx data.xlsx
+  python main.py new --xlsx data\\data-xsecure.xlsx
   # หลายเคสต่อเนื่อง (0 = ทุกแถว) ไม่ถามยืนยัน ถ้าเคสไหนพลาดจะข้ามไปเคสถัดไป
-  python main.py new --xlsx data.xlsx --limit 0 --yes
+  python main.py new --xlsx data\\data-xsecure.xlsx --limit 0 --yes
 
   # Resolve จาก Excel (แถวที่มี Record Case ID + Resolution และยังไม่ "Resolve complete")
-  python main.py resolve --xlsx data.xlsx --limit 0 --yes
+  python main.py resolve --xlsx data\\data-xsecure.xlsx --limit 0 --yes
   # หรือเคสเดียว
   python main.py resolve --case CAS-07898-DCAQP --type Resolved --text "ดำเนินการเรียบร้อย"
 
@@ -53,6 +53,7 @@ LIST_URL = (
 OPEN_CASE_FROM_LIST = True   # วิธี Resolve แบบกดหน้าจอ: เปิดเคสจากรายการ (ค้นหาเลขเคสแล้วคลิก) ไม่เปิดด้วยลิงก์ GUID
 RECORD_URL = f"{BASE}/main.aspx?appid={APP_ID}&forceUCI=1&pagetype=entityrecord&etn=incident&id="
 PROFILE_DIR = Path("browser_profile")          # ใช้ login เดียวกับ d365_recorder.py
+DATA_DIR = Path(__file__).resolve().parent / "data"
 # โฟลเดอร์เก็บภาพ/ไฟล์ผลลัพธ์ (สร้างให้อัตโนมัติ):
 #   results/form_row/      form_row*.png      ภาพฟอร์ม New Case ก่อนกด Save
 #   results/resolve/       resolve_*.png      ภาพหน้าต่าง Resolve ก่อนกด Resolve
@@ -64,6 +65,53 @@ def result_path(sub, filename):
     d = RESULTS_DIR / sub
     d.mkdir(parents=True, exist_ok=True)
     return d / filename
+
+
+def excel_files():
+    """คืนรายการไฟล์ Excel ใน data โดยเรียงตามชื่อ และไม่รวมไฟล์ชั่วคราวของ Excel"""
+    if not DATA_DIR.is_dir():
+        return []
+    return sorted(
+        (p for p in DATA_DIR.iterdir()
+         if p.is_file() and p.suffix.lower() in {".xlsx", ".xlsm"}
+         and not p.name.startswith("~$")),
+        key=lambda p: p.name.lower(),
+    )
+
+
+def select_xlsx():
+    """ให้ผู้ใช้เลือกไฟล์ Excel จาก data หรือระบุพาธเอง"""
+    files = excel_files()
+    if not files:
+        sys.exit(f"ไม่พบไฟล์ Excel ในโฟลเดอร์ {DATA_DIR}")
+
+    print(f"\nเลือกไฟล์ Excel จาก {DATA_DIR}:")
+    for i, path in enumerate(files, 1):
+        print(f"{i}. {path.name}")
+    while True:
+        choice = input("เลือกหมายเลขไฟล์ หรือระบุพาธไฟล์: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(files):
+            return files[int(choice) - 1]
+        path = Path(choice)
+        if path.is_file() and path.suffix.lower() in {".xlsx", ".xlsm"}:
+            return path
+        data_path = DATA_DIR / choice
+        if data_path.is_file() and data_path.suffix.lower() in {".xlsx", ".xlsm"}:
+            return data_path
+        print("ไม่พบไฟล์ Excel กรุณาเลือกหมายเลขหรือระบุพาธใหม่")
+
+
+def resolve_xlsx(path):
+    """รองรับทั้งพาธเต็ม พาธสัมพัทธ์ และชื่อไฟล์ที่อยู่ใน data"""
+    if path:
+        candidate = Path(path)
+        if candidate.is_file():
+            return candidate
+        data_path = DATA_DIR / path
+        if data_path.is_file():
+            return data_path
+        sys.exit(f"ไม่พบไฟล์ Excel: {path}")
+    return select_xlsx()
 
 
 SHEET = "Cases"                                 # ชื่อชีตที่ใช้ (ถ้าไม่พบชื่อนี้จะใช้ชีตที่เปิดค้างอยู่)
@@ -164,6 +212,47 @@ def set_text(page, data_id, value):
     el = vis(page, data_id)
     el.wait_for(timeout=20000)
     el.click()
+    el.fill(value)
+    el.press("Tab")           # ให้ D365 รับ change event
+
+
+def dismiss_title_suggestion(page):
+    """ปิดคำแนะนำค่าเดิมของ D365 ก่อนกรอก Case Title จาก Excel"""
+    selectors = [
+        '[data-id*="title"][data-id*="reject"]:visible',
+        '[data-id*="title"][data-id*="dismiss"]:visible',
+        '[data-id*="title"][data-id*="discard"]:visible',
+        '[data-id*="title"][data-id*="cancel"]:visible',
+        '[data-id*="suggestion"][data-id*="reject"]:visible',
+        '[data-id*="suggestion"][data-id*="dismiss"]:visible',
+        '[data-id*="suggestion"][data-id*="discard"]:visible',
+        '[data-id*="suggestion"][data-id*="cancel"]:visible',
+        '[aria-label*="reject" i]:visible',
+        '[aria-label*="dismiss" i]:visible',
+        '[aria-label*="discard" i]:visible',
+        '[aria-label*="decline" i]:visible',
+        '[title*="reject" i]:visible',
+        '[title*="dismiss" i]:visible',
+        '[title*="discard" i]:visible',
+        '[title*="decline" i]:visible',
+    ]
+    for selector in selectors:
+        button = page.locator(selector).first
+        if button.count():
+            button.click()
+            page.wait_for_timeout(300)
+            print("   ปิดคำแนะนำ Case Title แล้ว")
+            return True
+    return False
+
+
+def set_case_title(page, value):
+    """ปิดคำแนะนำที่อาจโผล่หลังโฟกัสช่อง แล้วกรอกชื่อเคสจาก Excel"""
+    el = vis(page, TITLE)
+    el.wait_for(timeout=20000)
+    el.click()
+    page.wait_for_timeout(300)
+    dismiss_title_suggestion(page)
     el.fill(value)
     el.press("Tab")           # ให้ D365 รับ change event
 
@@ -663,7 +752,7 @@ def _new_case_impl(page, sh, r, args, d, jw):
     vis(page, TITLE).wait_for(timeout=60000)
     jw.mark("เปิดฟอร์มใหม่")
 
-    set_text(page, TITLE, d["title"])
+    set_case_title(page, d["title"])
     jw.mark("หลังกรอก Case Title")
     if d["device"]:
         set_lookup(page, "ricoh_customerasset", d["device"])
@@ -1366,14 +1455,13 @@ def main():
             return
         apply_menu_choice(args, choice)
         if not args.xlsx:
-            path = input("ไฟล์ Excel [data.xlsx]: ").strip()
-            args.xlsx = path or "data.xlsx"
+            args.xlsx = select_xlsx()
         _menu_xlsx = args.xlsx
 
     if args.cmd == "resolve" and not (args.xlsx or (args.case and args.text)):
         sys.exit("resolve ต้องมี --xlsx หรือ --case ... --text ...")
-    if args.cmd == "new" and not args.xlsx:
-        sys.exit("new ต้องมี --xlsx")
+    if args.cmd in ("new", "resolve") and not (args.case and args.text):
+        args.xlsx = resolve_xlsx(args.xlsx)
 
     sh = Sheet(args.xlsx) if args.xlsx else None
     results = []          # (แถว, ผล, เหตุผล)
